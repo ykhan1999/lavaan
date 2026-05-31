@@ -88,7 +88,7 @@ lav_lavaan_step11_estoptim <- function(lavdata = NULL, # nolint
       )
       # Gauss-Newton
     } else if (lavoptions$optim.method == "gn") {
-      # only tested for DLS (for now)
+      # tested DLS and DWLS 
       x <- try(
         lav_optim_gn(
           lavmodel = lavmodel,
@@ -97,7 +97,7 @@ lav_lavaan_step11_estoptim <- function(lavdata = NULL, # nolint
           lavpartable = lavpartable,
           lavoptions = lavoptions
         ),
-        silent = TRUE
+        silent = FALSE
       )
 
       # Quasi-Newton

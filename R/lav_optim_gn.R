@@ -28,17 +28,17 @@ lav_objective_GN <- function(x, lavsamplestats = NULL, lavmodel = NULL,
     lavsamplestats = lavsamplestats
   )
   attributes(obj) <- NULL
-
+  
   has.ceq <- lavmodel@eq.constraints
   has.cin <- !is.null(body(lavmodel@cin.function))
-
+  
   # monitoring obj only
   if (!extra) {
     if (has.ceq || has.cin) {
       ceq0 <- if (has.ceq) lavmodel@ceq.function(x) else numeric(0L)
       cin0 <- if (has.cin) lavmodel@cin.function(x) else numeric(0L)
       con0 <- c(ceq0, cin0)
-
+      
       # Only evaluate penalty on the constraints that were active during the step
       if (!is.null(active.idx)) {
         con0 <- con0[active.idx]
@@ -50,14 +50,14 @@ lav_objective_GN <- function(x, lavsamplestats = NULL, lavmodel = NULL,
     }
     return(list(obj = obj, U.invQ = NULL, lambda = lambda, active.idx = active.idx))
   }
-
+  
   # model implied statistics
   lavimplied <- lav_model_implied(lavmodel = lavmodel)
   wls.est <- lav_model_wls_est(lavmodel = lavmodel, lavimplied = lavimplied)
-
+  
   # observed statistics
   wls.obs <- lavsamplestats@WLS.obs
-
+  
   # always use expected information
   A1 <- lav_model_h1_information_expected(
     lavobject = NULL, lavmodel = lavmodel,
@@ -68,7 +68,7 @@ lav_objective_GN <- function(x, lavsamplestats = NULL, lavmodel = NULL,
   
   # Delta
   Delta <- lav_model_delta(lavmodel = lavmodel)
-
+  
   # first group
   g <- 1L
   if (lavmodel@estimator == "DWLS") {
@@ -78,13 +78,13 @@ lav_objective_GN <- function(x, lavsamplestats = NULL, lavmodel = NULL,
   }
   Q.g <- PRE.g %*% (wls.obs[[g]] - wls.est[[g]])
   U.g <- PRE.g %*% Delta[[g]]
-
+  
   # additional groups (if any)
   if (lavsamplestats@ngroups > 1L) {
     fg <- lavsamplestats@nobs[[1]] / lavsamplestats@ntotal
     Q <- fg * Q.g
     U <- fg * U.g
-
+    
     for (g in 2:lavsamplestats@ngroups) {
       fg <- lavsamplestats@nobs[[g]] / lavsamplestats@ntotal
       if (lavmodel@estimator == "DWLS") {
@@ -94,7 +94,7 @@ lav_objective_GN <- function(x, lavsamplestats = NULL, lavmodel = NULL,
       }
       Q.g <- PRE.g %*% (wls.obs[[g]] - wls.est[[g]])
       U.g <- PRE.g %*% Delta[[g]]
-
+      
       Q <- Q + fg * Q.g
       U <- U + fg * U.g
     }
@@ -102,15 +102,30 @@ lav_objective_GN <- function(x, lavsamplestats = NULL, lavmodel = NULL,
     Q <- Q.g
     U <- U.g
   }
-
+  
+  npar <- nrow(U)
+  
   # handle equality and inequality constraints (Active Set Logic)
   if (has.ceq || has.cin) {
     ceq0 <- if (has.ceq) lavmodel@ceq.function(x) else numeric(0L)
     cin0 <- if (has.cin) lavmodel@cin.function(x) else numeric(0L)
     con0 <- c(ceq0, cin0)
-
+    
     nceq <- length(ceq0)
     ncin <- length(cin0)
+    ncon <- nceq + ncin
+    
+    # SAFELY ACQUIRE THE JACOBIAN (H)
+    H <- lavmodel@con.jac
+    # If H is missing, empty, or has mismatched columns, build it dynamically!
+    if (is.null(H) || nrow(H) != ncon || ncol(H) != npar) {
+      if (!requireNamespace("numDeriv", quietly = TRUE)) {
+        stop("The 'numDeriv' package is required to compute constraint Jacobians.")
+      }
+      H.eq <- if (nceq > 0) numDeriv::jacobian(func = lavmodel@ceq.function, x = x) else matrix(0, 0, npar)
+      H.in <- if (ncin > 0) numDeriv::jacobian(func = lavmodel@cin.function, x = x) else matrix(0, 0, npar)
+      H <- rbind(H.eq, H.in)
+    }
     
     # Flag which constraints are inequalities
     cin.flag <- c(rep(FALSE, nceq), rep(TRUE, ncin))
@@ -121,19 +136,17 @@ lav_objective_GN <- function(x, lavsamplestats = NULL, lavmodel = NULL,
       slack <- 1e-05 
       inactive.idx <- which(cin.flag & con0 > slack)
     }
-
-    H <- lavmodel@con.jac
+    
     active.idx <- seq_along(con0)
-
+    
     # Filter out inactive inequalities
     if (length(inactive.idx) > 0L) {
       con0 <- con0[-inactive.idx]
       H <- H[-inactive.idx, , drop = FALSE]
       active.idx <- active.idx[-inactive.idx]
     }
-
+    
     if (length(con0) > 0L) {
-      npar <- nrow(U)
       U <- U + crossprod(H)
       U <- rbind(
         cbind(U, t(H)),
@@ -141,10 +154,22 @@ lav_objective_GN <- function(x, lavsamplestats = NULL, lavmodel = NULL,
       )
       Q <- rbind(Q, matrix(-con0, nrow(H), 1))
     }
+  } else {
+    con0 <- numeric(0L)
   }
-
-  # compute step
-  U.invQ <- drop(solve(U, Q))
+  
+  # compute step using Robust Solver
+  U.invQ <- tryCatch({
+    drop(solve(U, Q))
+  }, error = function(e) {
+    if (!requireNamespace("MASS", quietly = TRUE)) {
+      # Fallback to ridge penalty if MASS isn't available
+      diag(U) <- diag(U) + 1e-05
+      drop(solve(U, Q))
+    } else {
+      drop(MASS::ginv(U) %*% Q)
+    }
+  })
   
   if ((has.ceq || has.cin) && length(con0) > 0L) {
     # merit function multipliers
@@ -153,10 +178,9 @@ lav_objective_GN <- function(x, lavsamplestats = NULL, lavmodel = NULL,
   } else {
     lambda <- NULL
   }
-
+  
   list(obj = obj, U.invQ = U.invQ, lambda = lambda, active.idx = active.idx)
 }
-
 lav_optim_gn <- function(lavmodel = NULL, lavsamplestats = NULL,
                          lavpartable = NULL,
                          lavdata = NULL, lavoptions = NULL) {
